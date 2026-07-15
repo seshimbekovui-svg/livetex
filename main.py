@@ -31,21 +31,27 @@ STATIC_RESPONSE = {
 }
 
 
-@app.post("/command/request")
-async def command_request(request: Request):
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+# Catch-all должен быть объявлен ПОСЛЕДНИМ — FastAPI матчит роуты по порядку,
+# иначе этот обработчик перехватит и /healthz, и вообще всё подряд.
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def catch_all(full_path: str, request: Request):
     headers = dict(request.headers)
+    query_params = dict(request.query_params)
     try:
         body = await request.json()
     except Exception:
         body = (await request.body()).decode("utf-8", errors="replace")
 
     logger.info("=== Новый запрос от edna ===")
+    logger.info("Method: %s", request.method)
+    logger.info("Path: /%s", full_path)
+    logger.info("Query params: %s", query_params)
     logger.info("Headers: %s", headers)
     logger.info("Body: %s", body)
 
     return JSONResponse(content=STATIC_RESPONSE, status_code=200)
-
-
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
