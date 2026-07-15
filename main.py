@@ -29,6 +29,19 @@ Content-Type: application/json, статус 200.
 Переменные окружения (задать в Render → Environment):
   JIRA_AUTH_TOKEN — готовая base64-строка для заголовка Authorization: Basic <...>
                     (у тебя уже есть, например "c2FtYXQuZXNoaW...")
+  EDNA_API_TOKEN  — Bearer-токен для API kompanion.edna.kz (ДРУГОЙ токен,
+                    не путать с JIRA_AUTH_TOKEN). Используется для запросов
+                    /api/v1/chatbot/tags и /api/v1/threads/{id}.
+
+Логика тегов:
+  1. При старте сервиса и лениво при первом запросе (если кэш пуст) —
+     подтягиваем полный список тегов /api/v1/chatbot/tags и кэшируем
+     в памяти как {id: name}. Список тегов меняется редко, поэтому кэш
+     без TTL — если понадобится принудительное обновление, перезапусти
+     сервис на Render (Manual Deploy → Restart).
+  2. На каждый вызов команды — запрашиваем /api/v1/threads/{threadId},
+     берём оттуда список id тегов треда, переводим через кэш в названия
+     и пишем в Jira в customfield_13049 (через запятую).
 """
 
 import logging
@@ -45,6 +58,10 @@ app = FastAPI()
 
 JIRA_URL = "https://bankkompanion.atlassian.net/rest/api/2/issue"
 JIRA_AUTH_TOKEN = os.getenv("JIRA_AUTH_TOKEN", "").strip()
+# На случай, если в переменной окружения токен вставлен вместе со словом
+# "Basic " — не дублируем его при формировании заголовка.
+if JIRA_AUTH_TOKEN.lower().startswith("basic "):
+    JIRA_AUTH_TOKEN = JIRA_AUTH_TOKEN[6:].strip()
 logger.info(
     "JIRA_AUTH_TOKEN загружен: длина=%s, начало='%s...', конец='...%s'",
     len(JIRA_AUTH_TOKEN),
@@ -52,8 +69,61 @@ logger.info(
     JIRA_AUTH_TOKEN[-4:] if len(JIRA_AUTH_TOKEN) >= 4 else JIRA_AUTH_TOKEN,
 )
 
+EDNA_API_BASE = "https://kompanion.edna.kz/api/v1"
+EDNA_API_TOKEN = os.getenv("EDNA_API_TOKEN", "").strip()
+if EDNA_API_TOKEN.lower().startswith("bearer "):
+    EDNA_API_TOKEN = EDNA_API_TOKEN[7:].strip()
 
-async def create_jira_issue(thread_id: str, operator_login: str) -> dict:
+# Кэш тегов в памяти: {"763": "2-линия", ...}
+_tags_cache: dict[str, str] = {}
+
+
+async def load_tags_cache() -> None:
+    """Подтягивает полный список тегов edna и кладёт в кэш."""
+    global _tags_cache
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{EDNA_API_BASE}/chatbot/tags",
+            headers={"Authorization": f"Bearer {BOT_API_TOKEN}"},
+        )
+        resp.raise_for_status()
+        tags = resp.json()
+    _tags_cache = {str(t["id"]): t["name"] for t in tags}
+    logger.info("Кэш тегов edna обновлён: %d тегов", len(_tags_cache))
+
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        await load_tags_cache()
+    except Exception:
+        logger.exception("Не удалось загрузить кэш тегов edna при старте")
+
+
+async def get_thread_tag_names(thread_id: str) -> str:
+    """Возвращает названия тегов треда через запятую (или пустую строку)."""
+    if not _tags_cache:
+        # Кэш почему-то пуст (например, старт не удался) — пробуем ещё раз.
+        try:
+            await load_tags_cache()
+        except Exception:
+            logger.exception("Повторная загрузка кэша тегов не удалась")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{EDNA_API_BASE}/threads/{thread_id}",
+            headers={"Authorization": f"Bearer {EDNA_API_TOKEN}"},
+        )
+        resp.raise_for_status()
+        thread = resp.json()
+
+    tag_ids = thread.get("tags", [])
+    tag_names = [_tags_cache.get(str(tid), f"Тег {tid}") for tid in tag_ids]
+    logger.info("Теги треда %s: id=%s -> names=%s", thread_id, tag_ids, tag_names)
+    return ", ".join(tag_names)
+
+
+async def create_jira_issue(thread_id: str, operator_login: str, tag_names: str) -> dict:
     """Создаёт тикет в Jira и возвращает распарсенный JSON-ответ."""
     payload = {
         "fields": {
@@ -63,6 +133,7 @@ async def create_jira_issue(thread_id: str, operator_login: str) -> dict:
             "description": f"Вы можете найти чат и описание жалобы по ID: {thread_id}",
             "customfield_13045": operator_login,
             "customfield_13050": str(thread_id),
+            "customfield_13049": tag_names,
         }
     }
     headers = {
@@ -105,7 +176,13 @@ async def catch_all(full_path: str, request: Request):
     )
 
     try:
-        issue = await create_jira_issue(thread_id, operator_login)
+        tag_names = await get_thread_tag_names(thread_id)
+    except Exception:
+        logger.exception("Не удалось получить теги треда %s", thread_id)
+        tag_names = ""
+
+    try:
+        issue = await create_jira_issue(thread_id, operator_login, tag_names)
         issue_key = issue.get("key")
         logger.info("Тикет создан: %s (%s)", issue_key, issue.get("self"))
         result_value = f"Создан тикет {issue_key}"
