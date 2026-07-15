@@ -104,7 +104,7 @@ async def catch_all(full_path: str, request: Request):
         logger.info("Тикет создан: %s (%s)", issue_key, issue.get("self"))
         result_value = f"Создан тикет {issue_key}"
     except httpx.HTTPStatusError as exc:
-        logger.exception("Jira вернула ошибку")
+        logger.error("Jira вернула ошибку %s: %s", exc.response.status_code, exc.response.text)
         result_value = f"Ошибка Jira: {exc.response.status_code} — {exc.response.text[:200]}"
     except Exception as exc:
         logger.exception("Не удалось создать тикет в Jira")
