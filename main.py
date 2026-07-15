@@ -44,7 +44,13 @@ logger = logging.getLogger("edna_test")
 app = FastAPI()
 
 JIRA_URL = "https://bankkompanion.atlassian.net/rest/api/2/issue"
-JIRA_AUTH_TOKEN = os.getenv("JIRA_AUTH_TOKEN", "")
+JIRA_AUTH_TOKEN = os.getenv("JIRA_AUTH_TOKEN", "").strip()
+logger.info(
+    "JIRA_AUTH_TOKEN загружен: длина=%s, начало='%s...', конец='...%s'",
+    len(JIRA_AUTH_TOKEN),
+    JIRA_AUTH_TOKEN[:6],
+    JIRA_AUTH_TOKEN[-4:] if len(JIRA_AUTH_TOKEN) >= 4 else JIRA_AUTH_TOKEN,
+)
 
 
 async def create_jira_issue(thread_id: str, operator_login: str) -> dict:
