@@ -27,11 +27,11 @@ Content-Type: application/json, статус 200.
 возвращает агенту ключ созданного тикета (например, RLCC-217).
 
 Переменные окружения (задать в Render → Environment):
-  JIRA_AUTH_TOKEN — готовая base64-строка для заголовка Authorization: Basic <...>
-                    (у тебя уже есть, например "c2FtYXQuZXNoaW...")
-  EDNA_API_TOKEN  — Bearer-токен для API kompanion.edna.kz (ДРУГОЙ токен,
-                    не путать с JIRA_AUTH_TOKEN). Используется для запросов
-                    /api/v1/chatbot/tags и /api/v1/threads/{id}.
+  JIRA_AUTH_TOKEN      — готовая base64-строка для заголовка Authorization: Basic <...>
+                         (у тебя уже есть, например "c2FtYXQuZXNoaW...")
+  EDNA_TAGS_API_TOKEN  — Bearer-токен для GET /api/v1/chatbot/tags
+  EDNA_THREAD_API_TOKEN — Bearer-токен для GET /api/v1/threads/{id}
+                         (это ДРУГОЙ токен, не тот же, что для тегов!)
 
 Логика тегов:
   1. При старте сервиса и лениво при первом запросе (если кэш пуст) —
@@ -70,9 +70,18 @@ logger.info(
 )
 
 EDNA_API_BASE = "https://kompanion.edna.kz/api/v1"
-EDNA_API_TOKEN = os.getenv("EDNA_API_TOKEN", "").strip()
-if EDNA_API_TOKEN.lower().startswith("bearer "):
-    EDNA_API_TOKEN = EDNA_API_TOKEN[7:].strip()
+
+
+def _clean_bearer(raw: str) -> str:
+    """Убирает случайно вставленное слово 'Bearer' из переменной окружения."""
+    raw = raw.strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    return raw
+
+
+EDNA_TAGS_API_TOKEN = _clean_bearer(os.getenv("EDNA_TAGS_API_TOKEN", ""))
+EDNA_THREAD_API_TOKEN = _clean_bearer(os.getenv("EDNA_THREAD_API_TOKEN", ""))
 
 # Кэш тегов в памяти: {"763": "2-линия", ...}
 _tags_cache: dict[str, str] = {}
@@ -84,7 +93,7 @@ async def load_tags_cache() -> None:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{EDNA_API_BASE}/chatbot/tags",
-            headers={"Authorization": f"Bearer {BOT_API_TOKEN}"},
+            headers={"Authorization": f"Bearer {EDNA_TAGS_API_TOKEN}"},
         )
         resp.raise_for_status()
         tags = resp.json()
@@ -112,7 +121,7 @@ async def get_thread_tag_names(thread_id: str) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{EDNA_API_BASE}/threads/{thread_id}",
-            headers={"Authorization": f"Bearer {EDNA_API_TOKEN}"},
+            headers={"Authorization": f"Bearer {EDNA_THREAD_API_TOKEN}"},
         )
         resp.raise_for_status()
         thread = resp.json()
