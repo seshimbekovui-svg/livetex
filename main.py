@@ -1,17 +1,29 @@
 """
 Тестовый сервис для универсальной команды edna Chat Center.
 
-Пока НИЧЕГО не парсит и никуда не ходит — просто:
-  1. Логирует всё, что прислала edna (метод, заголовки, тело).
-  2. Отвечает одним и тем же статичным JSON с кодом 200.
+СХЕМА ЗАПРОСА ОТ EDNA (подтверждена реальным вызовом):
+  {
+    "requestType": "POST",
+    "messageId": "9bd3611a-...",     # эхом вернуть в ответе
+    "threadId": "26872",
+    "operatorLogin": "operator",     # логин агента, вызвавшего команду
+    "clientId": "TG:6173617794:...", # эхом вернуть в ответе
+    "commandCode": "request",        # то самое поле "Код" из админки —
+                                      # используется для роутинга, если
+                                      # несколько команд ведут на один URL
+    "params": [],                    # аргументы, введённые агентом после команды
+    "host": "https://..."            # служебное, не используем
+  }
 
-Это нужно, чтобы:
-  - убедиться, что edna вообще достучалась до сервиса;
-  - увидеть в логах Render реальный формат запроса от edna;
-  - проверить, что агент в АРМ увидел ответ, и в каком именно поле
-    edna ожидает текст (мы вернём сразу несколько вариантов полей —
-    text/message/result — чтобы понять по логам и по факту отображения,
-    какое из них edna реально использует).
+СХЕМА ОТВЕТА (подтверждена примером кода от поддержки edna):
+  {
+    "clientId": "<эхо из запроса>",
+    "messageId": "<эхо из запроса>",
+    "params": [
+      {"key": "<параметр>", "value": "<значение>"}
+    ]
+  }
+Content-Type: application/json, статус 200.
 """
 
 import logging
@@ -24,12 +36,6 @@ logger = logging.getLogger("edna_test")
 
 app = FastAPI()
 
-STATIC_RESPONSE = {
-    "text": "Статус: успешно изменено\nЗначение: Обработано оператором СПК",
-    "message": "Статус: успешно изменено\nЗначение: Обработано оператором СПК",
-    "result": "Статус: успешно изменено\nЗначение: Обработано оператором СПК",
-}
-
 
 @app.get("/healthz")
 async def healthz():
@@ -40,18 +46,39 @@ async def healthz():
 # иначе этот обработчик перехватит и /healthz, и вообще всё подряд.
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def catch_all(full_path: str, request: Request):
-    headers = dict(request.headers)
-    query_params = dict(request.query_params)
     try:
         body = await request.json()
     except Exception:
-        body = (await request.body()).decode("utf-8", errors="replace")
+        body = {}
 
     logger.info("=== Новый запрос от edna ===")
-    logger.info("Method: %s", request.method)
-    logger.info("Path: /%s", full_path)
-    logger.info("Query params: %s", query_params)
-    logger.info("Headers: %s", headers)
     logger.info("Body: %s", body)
 
-    return JSONResponse(content=STATIC_RESPONSE, status_code=200)
+    message_id = body.get("messageId")
+    client_id = body.get("clientId")
+    thread_id = body.get("threadId")
+    operator_login = body.get("operatorLogin")
+    command_code = body.get("commandCode")
+    params = body.get("params", [])
+
+    logger.info(
+        "commandCode=%s threadId=%s operatorLogin=%s params=%s",
+        command_code, thread_id, operator_login, params,
+    )
+
+    # Роутинг по commandCode — так один URL сможет обслуживать
+    # несколько разных команд, настроенных в админке edna.
+    if command_code == "request":
+        result_value = "Тестовый ответ от сервиса (команда 'request' получена)"
+    else:
+        result_value = f"Неизвестный commandCode: {command_code}"
+
+    data = {
+        "clientId": client_id,
+        "messageId": message_id,
+        "params": [
+            {"key": "Результат", "value": result_value}
+        ],
+    }
+
+    return JSONResponse(content=data, status_code=200, media_type="application/json")
