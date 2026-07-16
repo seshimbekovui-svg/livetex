@@ -1,5 +1,5 @@
 """
-Тестовый сервис для универсальной команды edna Chat Center.
+Сервис для универсальной команды edna Chat Center.
 
 СХЕМА ЗАПРОСА ОТ EDNA (подтверждена реальным вызовом):
   {
@@ -8,7 +8,7 @@
     "threadId": "26872",
     "operatorLogin": "operator",     # логин агента, вызвавшего команду
     "clientId": "TG:6173617794:...", # эхом вернуть в ответе
-    "commandCode": "request",        # то самое поле "Код" из админки
+    "commandCode": "request",        # то самое поле "Код" из админки edna
     "params": [],                    # аргументы, введённые агентом после команды
     "host": "https://..."            # служебное, не используем
   }
@@ -23,31 +23,25 @@
   }
 Content-Type: application/json, статус 200.
 
-При получении команды сервис создаёт тикет в Jira (проект RLCC) и
-возвращает агенту ключ созданного тикета (например, RLCC-217).
+При получении команды сервис:
+  1. Создаёт тикет в Jira (проект RLCC).
+  2. Тянет теги треда из edna, находит среди них "иерархический" тег вида
+     "Уровень1 / Уровень3 / Уровень4" (три части через " / "), переводит
+     каждую часть через справочник в код SMAX (SPKFirstLevel_c и т.д.),
+     собирает из этого JSON-тело в формате заявки SMAX и кладёт его как
+     ТЕКСТ в поле description тикета Jira (реального похода в SMAX API
+     пока нет — только сборка тела на будущее).
+  3. Возвращает агенту ключ созданного тикета (например, RLCC-217).
 
 Переменные окружения (задать в Render → Environment):
-  JIRA_AUTH_TOKEN      — готовая base64-строка для заголовка Authorization: Basic <...>
-                         (у тебя уже есть, например "c2FtYXQuZXNoaW...")
-  EDNA_TAGS_API_TOKEN  — Bearer-токен для GET /api/v1/chatbot/tags
+  JIRA_AUTH_TOKEN       — готовая base64-строка для Authorization: Basic <...>
+                          (только сам токен, без слова "Basic")
+  EDNA_TAGS_API_TOKEN   — Bearer-токен для GET /api/v1/chatbot/tags
   EDNA_THREAD_API_TOKEN — Bearer-токен для GET /api/v1/threads/{id}
-                         (это ДРУГОЙ токен, не тот же, что для тегов!)
-
-Аутентификация и токен SMAX вынесены в отдельный модуль smax_client.py —
-см. его докстринг и переменные окружения SMAX_LOGIN/SMAX_PASSWORD там.
-
-Логика тегов:
-  1. При старте сервиса и лениво при первом запросе (если кэш пуст) —
-     подтягиваем полный список тегов /api/v1/chatbot/tags и кэшируем
-     в памяти как {id: name}. Список тегов меняется редко, поэтому кэш
-     без TTL — если понадобится принудительное обновление, перезапусти
-     сервис на Render (Manual Deploy → Restart).
-  2. На каждый вызов команды — запрашиваем /api/v1/threads/{threadId},
-     берём оттуда список id тегов треда, переводим через кэш в названия
-     и пишем в Jira в customfield_13049 (через запятую).
+                          (это ДРУГОЙ токен, не тот же, что для тегов!)
 """
 
-import asyncio
+import json
 import logging
 import os
 
@@ -55,13 +49,14 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-import smax_client
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("edna_test")
 
 app = FastAPI()
 
+# ---------------------------------------------------------------------------
+# Jira
+# ---------------------------------------------------------------------------
 JIRA_URL = "https://bankkompanion.atlassian.net/rest/api/2/issue"
 JIRA_AUTH_TOKEN = os.getenv("JIRA_AUTH_TOKEN", "").strip()
 # На случай, если в переменной окружения токен вставлен вместе со словом
@@ -75,6 +70,9 @@ logger.info(
     JIRA_AUTH_TOKEN[-4:] if len(JIRA_AUTH_TOKEN) >= 4 else JIRA_AUTH_TOKEN,
 )
 
+# ---------------------------------------------------------------------------
+# edna API (теги и детали треда)
+# ---------------------------------------------------------------------------
 EDNA_API_BASE = "https://kompanion.edna.kz/api/v1"
 
 
@@ -88,8 +86,6 @@ def _clean_bearer(raw: str) -> str:
 
 EDNA_TAGS_API_TOKEN = _clean_bearer(os.getenv("EDNA_TAGS_API_TOKEN", ""))
 EDNA_THREAD_API_TOKEN = _clean_bearer(os.getenv("EDNA_THREAD_API_TOKEN", ""))
-
-app.include_router(smax_client.router)
 
 # Кэш тегов в памяти: {"763": "2-линия", ...}
 _tags_cache: dict[str, str] = {}
@@ -116,15 +112,10 @@ async def on_startup():
     except Exception:
         logger.exception("Не удалось загрузить кэш тегов edna при старте")
 
-    # Фоновый цикл сам сделает первый refresh сразу при запуске,
-    # а затем будет повторять его каждые 15 минут, не блокируя сервер.
-    asyncio.create_task(smax_client.smax_token_refresh_loop())
 
-
-async def get_thread_tag_names(thread_id: str) -> str:
-    """Возвращает названия тегов треда через запятую (или пустую строку)."""
+async def get_thread_tag_names(thread_id: str) -> list[str]:
+    """Возвращает СПИСОК названий тегов треда (не строку)."""
     if not _tags_cache:
-        # Кэш почему-то пуст (например, старт не удался) — пробуем ещё раз.
         try:
             await load_tags_cache()
         except Exception:
@@ -141,20 +132,131 @@ async def get_thread_tag_names(thread_id: str) -> str:
     tag_ids = thread.get("tags", [])
     tag_names = [_tags_cache.get(str(tid), f"Тег {tid}") for tid in tag_ids]
     logger.info("Теги треда %s: id=%s -> names=%s", thread_id, tag_ids, tag_names)
-    return ", ".join(tag_names)
+    return tag_names
 
 
-async def create_jira_issue(thread_id: str, operator_login: str, tag_names: str) -> dict:
+# ---------------------------------------------------------------------------
+# Разбор иерархического тега ("Уровень1 / Уровень3 / Уровень4") и сборка
+# JSON-тела заявки SMAX (пока только как текст для description в Jira).
+# ---------------------------------------------------------------------------
+
+# Справочник значений — сверено со скриншотом. Дополняй по мере появления
+# новых вариантов тегов.
+TAG_LEVEL_MAPPING: dict[str, dict[str, str]] = {
+    "first": {
+        "Кредиты": "Loans_c",
+        "Платежные карты": "PaymentCards_c",
+    },
+    "third": {
+        "Онлайн кредит": "OnlineLoan_c",
+        "Платежные карты": "VISAGoldCard_c",
+    },
+    "fourth": {
+        "Безакцептное списание": "DirectDebit_c",
+        'Выходит "Ошибка приложения"': "ApplicationError_c",
+    },
+}
+
+
+def find_hierarchical_tag(tag_names: list[str]) -> str | None:
+    """Находит среди тегов треда тот, что имеет формат 'A / B / C'."""
+    for name in tag_names:
+        if name.count("/") == 2:
+            return name
+    return None
+
+
+def split_and_map_tag(tag: str) -> tuple[str, str, str]:
+    """
+    Разбивает тег вида "Кредиты / Онлайн кредит / Безакцептное списание"
+    на 3 уровня (разделитель " / ", учитывая пробелы) и переводит каждый
+    уровень через справочник в код SMAX. Если значения нет в справочнике —
+    подставляется исходный текст как есть (чтобы не терять данные молча).
+    """
+    parts = [p.strip() for p in tag.split("/")]
+    parts = (parts + ["", "", ""])[:3]  # подстраховка, если частей не 3
+    level1_raw, level3_raw, level4_raw = parts
+
+    first_code = TAG_LEVEL_MAPPING["first"].get(level1_raw, level1_raw)
+    third_code = TAG_LEVEL_MAPPING["third"].get(level3_raw, level3_raw)
+    fourth_code = TAG_LEVEL_MAPPING["fourth"].get(level4_raw, level4_raw)
+
+    logger.info(
+        "Разбор тега '%s' -> first='%s' third='%s' fourth='%s'",
+        tag, first_code, third_code, fourth_code,
+    )
+    return first_code, third_code, fourth_code
+
+
+def build_smax_request_body(thread_id: str, spk_first: str, spk_third: str, spk_fourth: str) -> dict:
+    """
+    Собирает JSON-тело заявки в формате SMAX (как на скриншоте).
+
+    ВАЖНО: часть полей ниже — статичные заглушки (RequestedByPerson,
+    RequestsOffering, CustomersNumber_c, CurrentClientID_c,
+    ClientOperatingSystemVersion_c, ClientApplicationVersion_c) — источник
+    реальных значений для них пока не определён. Когда появится, где их
+    брать (из edna, из другого API, из настроек агента) — подставим
+    динамически вместо этих значений по умолчанию.
+    """
+    return {
+        "entities": [
+            {
+                "entity_type": "Request",
+                "properties": {
+                    "RequestedByPerson": "12458",
+                    "RequestedForPerson": "12458",
+                    "RequestsOffering": "497669",
+                    "CustomersNumber_c": "996228021941",
+                    "CurrentClientID_c": "Самат Эшимбеков - 124595",
+                    "SPKFirstLevel_c": spk_first,
+                    "SPKThirdLevel_c": spk_third,
+                    "SPKFourthLevel_c": spk_fourth,
+                    "ClientOperatingSystemVersion_c": "Android - 12",
+                    "ClientApplicationVersion_c": "1.5",
+                    "Description": f"Вы можете найти чат и описание жалобы по ID: {thread_id}",
+                    "Urgency": "SlightDisruption",
+                    "RequestType": "SupportRequest",
+                },
+                "layout": "Id,RequestedByPerson,Status,DisplayLabel",
+            }
+        ],
+        "operation": "CREATE",
+    }
+
+
+def build_jira_description(thread_id: str, tag_names: list[str]) -> str:
+    """
+    Если среди тегов треда есть иерархический (A / B / C) — собирает JSON
+    заявки SMAX и возвращает его как текст для description в Jira.
+    Если такого тега нет — просто ссылка на тред, как раньше.
+    """
+    hierarchical_tag = find_hierarchical_tag(tag_names)
+    if not hierarchical_tag:
+        return f"Вы можете найти чат и описание жалобы по ID: {thread_id}"
+
+    spk_first, spk_third, spk_fourth = split_and_map_tag(hierarchical_tag)
+    smax_body = build_smax_request_body(thread_id, spk_first, spk_third, spk_fourth)
+    return json.dumps(smax_body, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Создание тикета в Jira
+# ---------------------------------------------------------------------------
+async def create_jira_issue(thread_id: str, operator_login: str, tag_names: list[str]) -> dict:
     """Создаёт тикет в Jira и возвращает распарсенный JSON-ответ."""
+    description = build_jira_description(thread_id, tag_names)
+    tag_names_joined = ", ".join(tag_names)
+
     payload = {
         "fields": {
             "project": {"key": "RLCC"},
             "summary": "Жалоба от Edna",
             "issuetype": {"name": "Task"},
-            "description": f"Вы можете найти чат и описание жалобы по ID: {thread_id}",
+            "description": description,
             "customfield_13045": operator_login,
             "customfield_13050": str(thread_id),
-            "customfield_13049": tag_names,
+            "customfield_13049": tag_names_joined,
         }
     }
     headers = {
@@ -167,6 +269,9 @@ async def create_jira_issue(thread_id: str, operator_login: str, tag_names: str)
         return resp.json()
 
 
+# ---------------------------------------------------------------------------
+# Роуты
+# ---------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
@@ -207,7 +312,7 @@ async def catch_all(full_path: str, request: Request):
         tag_names = await get_thread_tag_names(thread_id)
     except Exception:
         logger.exception("Не удалось получить теги треда %s", thread_id)
-        tag_names = ""
+        tag_names = []
 
     try:
         issue = await create_jira_issue(thread_id, operator_login, tag_names)
