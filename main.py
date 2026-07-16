@@ -33,6 +33,9 @@ Content-Type: application/json, статус 200.
   EDNA_THREAD_API_TOKEN — Bearer-токен для GET /api/v1/threads/{id}
                          (это ДРУГОЙ токен, не тот же, что для тегов!)
 
+Аутентификация и токен SMAX вынесены в отдельный модуль smax_client.py —
+см. его докстринг и переменные окружения SMAX_LOGIN/SMAX_PASSWORD там.
+
 Логика тегов:
   1. При старте сервиса и лениво при первом запросе (если кэш пуст) —
      подтягиваем полный список тегов /api/v1/chatbot/tags и кэшируем
@@ -44,12 +47,15 @@ Content-Type: application/json, статус 200.
      и пишем в Jira в customfield_13049 (через запятую).
 """
 
+import asyncio
 import logging
 import os
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+import smax_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("edna_test")
@@ -83,6 +89,8 @@ def _clean_bearer(raw: str) -> str:
 EDNA_TAGS_API_TOKEN = _clean_bearer(os.getenv("EDNA_TAGS_API_TOKEN", ""))
 EDNA_THREAD_API_TOKEN = _clean_bearer(os.getenv("EDNA_THREAD_API_TOKEN", ""))
 
+app.include_router(smax_client.router)
+
 # Кэш тегов в памяти: {"763": "2-линия", ...}
 _tags_cache: dict[str, str] = {}
 
@@ -107,6 +115,10 @@ async def on_startup():
         await load_tags_cache()
     except Exception:
         logger.exception("Не удалось загрузить кэш тегов edna при старте")
+
+    # Фоновый цикл сам сделает первый refresh сразу при запуске,
+    # а затем будет повторять его каждые 15 минут, не блокируя сервер.
+    asyncio.create_task(smax_client.smax_token_refresh_loop())
 
 
 async def get_thread_tag_names(thread_id: str) -> str:
@@ -183,6 +195,13 @@ async def catch_all(full_path: str, request: Request):
         "commandCode=%s threadId=%s operatorLogin=%s params=%s",
         command_code, thread_id, operator_login, params,
     )
+
+    # Защита от служебных/пустых запросов (например, health-check пинги от
+    # Render на "/"). Без threadId и commandCode это точно не вызов
+    # команды агентом — тикет в Jira создавать не нужно.
+    if not thread_id or not command_code:
+        logger.info("Пропускаем: это не похоже на реальный вызов команды edna")
+        return JSONResponse(content={"status": "ignored"}, status_code=200)
 
     try:
         tag_names = await get_thread_tag_names(thread_id)
